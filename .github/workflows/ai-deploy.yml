@@ -1,0 +1,270 @@
+name: AI Deploy Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Stage 1: Code quality ──────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install ruff==0.15.22 && ruff check app/
+
+  # ── Stage 2: Unit + integration tests ─────────────────────────
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        credentials:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+        env:
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: insurance_ai
+          POSTGRES_USER: admin
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Create test database
+        run: PGPASSWORD=secret psql -h localhost -U admin -d insurance_ai -c "CREATE DATABASE insurance_ai_test;"
+      - run: pip install -r requirements.txt
+      - run: pytest tests/ -v --ignore=tests/evals
+        env:
+          DATABASE_URL: postgresql+asyncpg://admin:secret@localhost:5432/insurance_ai
+          SYNC_DATABASE_URL: postgresql://admin:secret@localhost:5432/insurance_ai
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          SENDGRID_FROM_EMAIL: test@example.com
+
+  # ── Stage 3: AI Eval Gate (blocks main merges) ────────────────
+  eval-gate:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    if: github.ref == 'refs/heads/main'
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        credentials:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+        env:
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: insurance_ai_eval
+          POSTGRES_USER: admin
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - name: Run schema migrations
+        # auth.sql intentionally excluded: this DB never gets the ORM-managed
+        # tables (advisors, clients, ...) that init_db() creates at app boot,
+        # so `ALTER TABLE advisors` has nothing to alter here. It's only
+        # needed against prod (deploy-staging below), where those tables
+        # already exist from previous deployments.
+        run: |
+          python scripts/apply_migrations.py \
+            "postgresql://admin:secret@localhost:5432/insurance_ai_eval" \
+            migrations/init.sql migrations/agents.sql migrations/governance.sql migrations/hnsw_index.sql
+      - name: Ingest policy documents
+        # The Policy Research agent (and its RAGAS eval) need real chunks in
+        # policy_chunks — this DB is freshly migrated and otherwise empty.
+        run: python scripts/reingest_policies.py
+        env:
+          PYTHONPATH: .
+          DATABASE_URL: postgresql+asyncpg://admin:secret@localhost:5432/insurance_ai_eval
+          SYNC_DATABASE_URL: postgresql://admin:secret@localhost:5432/insurance_ai_eval
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+      - name: Run AI Evaluation Gate
+        run: python tests/evals/run_evals.py
+        env:
+          PYTHONPATH: .
+          DATABASE_URL: postgresql+asyncpg://admin:secret@localhost:5432/insurance_ai_eval
+          SYNC_DATABASE_URL: postgresql://admin:secret@localhost:5432/insurance_ai_eval
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          SENDGRID_FROM_EMAIL: noreply@example.com
+
+  # ── Stage 4: Build + push to Lightsail registry ──────────────
+  build:
+    runs-on: ubuntu-latest
+    needs: [unit-tests, eval-gate]
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lightsailctl plugin
+        run: |
+          sudo curl -sL "https://s3.us-west-2.amazonaws.com/lightsailctl/latest/linux-amd64/lightsailctl" \
+            -o /usr/local/bin/lightsailctl
+          sudo chmod +x /usr/local/bin/lightsailctl
+      - name: Build image
+        run: docker build -t insurance-advisor-ai:${{ github.sha }} .
+      - name: Push to Lightsail registry
+        id: push
+        run: |
+          set -o pipefail
+          aws lightsail push-container-image \
+            --region ap-south-1 \
+            --service-name ${{ vars.LIGHTSAIL_SERVICE_NAME }} \
+            --label app \
+            --image insurance-advisor-ai:${{ github.sha }} 2>&1 | tee /tmp/push_out.txt
+          IMAGE=$(grep "Refer to this image as" /tmp/push_out.txt | sed 's/.*"\(.*\)".*/\1/')
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
+
+  # ── Stage 5: Deploy to Lightsail staging ─────────────────────
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install psycopg2-binary==2.9.9
+
+      - name: Run production schema migrations
+        # Ledger-backed: apply_migrations.py records each applied file in a
+        # schema_migrations table and skips ones already there, so a deploy
+        # only ever applies what's actually missing from prod.
+        run: |
+          python scripts/apply_migrations.py "$MIGRATION_DB_URL" \
+            migrations/init.sql migrations/agents.sql migrations/governance.sql \
+            migrations/whatsapp_logs.sql migrations/email_logs_add_edited_body.sql \
+            migrations/rls.sql migrations/hnsw_index.sql migrations/auth.sql \
+            migrations/roles.sql migrations/mcp_tokens.sql migrations/claims.sql
+        env:
+          # PROD_SYNC_DATABASE_URL is a plain postgresql:// URI (libpq-compatible);
+          # PROD_DATABASE_URL is asyncpg-prefixed and won't work with psycopg2.
+          MIGRATION_DB_URL: ${{ secrets.PROD_SYNC_DATABASE_URL }}
+
+      - name: Deploy to Lightsail
+        run: |
+          PREV_VERSION=$(aws lightsail get-container-service-deployments \
+            --service-name ${{ vars.LIGHTSAIL_SERVICE_NAME }} \
+            --region ap-south-1 \
+            --query 'deployments[0].version' --output text 2>/dev/null || echo 0)
+          [ "$PREV_VERSION" = "None" ] && PREV_VERSION=0
+          echo "NEW_VERSION=$((PREV_VERSION + 1))" >> $GITHUB_ENV
+
+          aws lightsail create-container-service-deployment \
+            --region ap-south-1 \
+            --service-name ${{ vars.LIGHTSAIL_SERVICE_NAME }} \
+            --containers "{
+              \"app\": {
+                \"image\": \"${{ needs.build.outputs.image }}\",
+                \"ports\": {\"8000\": \"HTTP\"},
+                \"environment\": {
+                  \"DATABASE_URL\": \"${{ secrets.PROD_DATABASE_URL }}\",
+                  \"SYNC_DATABASE_URL\": \"${{ secrets.PROD_SYNC_DATABASE_URL }}\",
+                  \"SECRET_KEY\": \"${{ secrets.SECRET_KEY }}\",
+                  \"OPENAI_API_KEY\": \"${{ secrets.OPENAI_API_KEY }}\",
+                  \"SENDGRID_API_KEY\": \"${{ secrets.SENDGRID_API_KEY }}\",
+                  \"SENDGRID_FROM_EMAIL\": \"${{ secrets.SENDGRID_FROM_EMAIL }}\",
+                  \"META_WHATSAPP_TOKEN\": \"${{ secrets.META_WHATSAPP_TOKEN }}\",
+                  \"META_PHONE_NUMBER_ID\": \"${{ secrets.META_PHONE_NUMBER_ID }}\",
+                  \"META_VERIFY_TOKEN\": \"${{ secrets.META_VERIFY_TOKEN }}\",
+                  \"AWS_REGION\": \"ap-south-1\",
+                  \"POLICIES_S3_BUCKET\": \"${{ secrets.POLICIES_S3_BUCKET }}\",
+                  \"POLICIES_S3_PREFIX\": \"\",
+                  \"POLICIES_SQS_QUEUE_URL\": \"${{ secrets.POLICIES_SQS_QUEUE_URL }}\",
+                  \"CLOUDWATCH_LOG_GROUP\": \"/insurance-advisor-ai/app\",
+                  \"AWS_ACCESS_KEY_ID\": \"${{ secrets.APP_AWS_ACCESS_KEY_ID }}\",
+                  \"AWS_SECRET_ACCESS_KEY\": \"${{ secrets.APP_AWS_SECRET_ACCESS_KEY }}\"
+                }
+              }
+            }" \
+            --public-endpoint "{
+              \"containerName\": \"app\",
+              \"containerPort\": 8000,
+              \"healthCheck\": {\"path\": \"/health\", \"intervalSeconds\": 10}
+            }"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
+
+      - name: Wait for new deployment to become ACTIVE
+        run: |
+          # create-container-service-deployment only submits the request --
+          # it doesn't wait for Lightsail to actually roll the new version
+          # out. If the container crashes on startup, Lightsail marks this
+          # deployment FAILED and silently keeps the previous version
+          # serving traffic, so a plain /health curl (next step) can't
+          # detect it -- the old, still-healthy nodes answer for it. Poll
+          # this specific deployment's own state instead.
+          for i in $(seq 1 20); do
+            STATE=$(aws lightsail get-container-service-deployments \
+              --service-name ${{ vars.LIGHTSAIL_SERVICE_NAME }} \
+              --region ap-south-1 \
+              --query "deployments[?version==\`${NEW_VERSION}\`] | [0].state" \
+              --output text)
+            echo "Attempt $i: deployment v${NEW_VERSION} state=$STATE"
+            [ "$STATE" = "ACTIVE" ] && break
+            if [ "$STATE" = "FAILED" ]; then
+              echo "Deployment v${NEW_VERSION} FAILED -- check container logs:"
+              echo "aws lightsail get-container-log --service-name ${{ vars.LIGHTSAIL_SERVICE_NAME }} --container-name app --region ap-south-1"
+              exit 1
+            fi
+            sleep 15
+          done
+          [ "$STATE" = "ACTIVE" ] || (echo "Deployment v${NEW_VERSION} did not reach ACTIVE within timeout (state=$STATE)" && exit 1)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
+
+      - name: Wait for service to be healthy
+        run: |
+          SERVICE_URL=$(aws lightsail get-container-services \
+            --service-name ${{ vars.LIGHTSAIL_SERVICE_NAME }} \
+            --region ap-south-1 \
+            --query "containerServices[0].url" \
+            --output text)
+          echo "Service URL: $SERVICE_URL"
+          for i in $(seq 1 20); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}health")
+            echo "Attempt $i: HTTP $STATUS"
+            [ "$STATUS" = "200" ] && break
+            sleep 15
+          done
+          [ "$STATUS" = "200" ] || (echo "Service did not become healthy" && exit 1)
+          echo "SERVICE_URL=$SERVICE_URL" >> $GITHUB_ENV
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
+
+      - name: Trigger policy RAG ingest
+        run: |
+          RESULT=$(curl -s -X POST "${SERVICE_URL}api/v1/ingest/all")
+          echo "Ingest result: $RESULT"
+          echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Chunks ingested: {d[\"total_chunks_ingested\"]}')" || true
